@@ -1,19 +1,31 @@
---// Reset Teleport Controller
---// Designed for your own Roblox game / clone.
---// Kaitun usage:
---//     local ok, reason = _G.ResetTeleport:Request("Jungle")
---//     while _G.ResetTeleport:IsBusy() do task.wait(0.2) end
---//
---// Required map structure (recommended):
---// Workspace
---//   \- Islands
---//      \- Jungle (Model / BasePart)
---//      \- Desert (Model / BasePart)
---//
---// Optional per-island safe point:
---//   Part named "TravelPoint", "SafePoint", "Spawn", "Center"
---// or an Attribute named "TravelPoint" is not used because Attributes
---// cannot directly store a Vector3 on all game setups.
+--============================================================
+-- Reset Teleport Adapter
+-- For your own Roblox game / clone or a hub that exposes a
+-- public/shared travel request.
+--
+-- USER CONFIG (kept intentionally small):
+-- _G.OneClickSettings = {
+--     ["Reset Teleport"] = true,
+--     ["Reset Teleport Delay"] = 2.5
+-- }
+--
+-- PUBLIC INPUTS SUPPORTED BY THE ADAPTER:
+-- 1) _G.KaitunTargetIsland = "Jungle"
+-- 2) _G.TargetIsland        = "Jungle"
+-- 3) ReplicatedStorage.KaitunTravelRequest (BindableEvent)
+--    Fire("Jungle")
+--
+-- PUBLIC OUTPUT:
+-- _G.ResetTeleportResult = {
+--     Success = true/false,
+--     Reason = "Complete" / ...,
+--     TargetIsland = "Jungle"
+-- }
+--
+-- IMPORTANT:
+-- A closed third-party hub that exposes NONE of these signals cannot be
+-- reliably integrated by this adapter. It must expose a public handoff/API.
+--============================================================
 
 if not game:IsLoaded() then
     game.Loaded:Wait()
@@ -22,15 +34,12 @@ end
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local PathfindingService = game:GetService("PathfindingService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 
 _G.OneClickSettings = _G.OneClickSettings or {}
 local UserSettings = _G.OneClickSettings
-
---==================================================
--- PUBLIC CONFIG (ONLY THE TWO USER SETTINGS)
---==================================================
 
 if UserSettings["Reset Teleport"] == nil then
     UserSettings["Reset Teleport"] = true
@@ -40,9 +49,9 @@ if UserSettings["Reset Teleport Delay"] == nil then
     UserSettings["Reset Teleport Delay"] = 2.5
 end
 
---==================================================
+--============================================================
 -- INTERNAL DEFAULTS
---==================================================
+--============================================================
 
 local DEFAULTS = {
     TravelDistance = 1500,
@@ -50,84 +59,19 @@ local DEFAULTS = {
     WaypointTimeout = 10,
     StuckTimeout = 4,
     ArrivalRadius = 100,
-    MaxRecoveries = 3,
-    RespawnTimeout = 15,
-    NormalMoveTimeout = 12,
-    NormalRepathInterval = 1.0,
-    PositionEpsilon = 3,
+    IslandSearchRadius = 120,
     FinalApproachDistance = 450,
-    DestinationSearchRadius = 120,
+    RespawnTimeout = 15,
     PostRespawnDelay = 0.5,
+    NormalMoveTimeout = 12,
+    PollInterval = 0.25,
+    MaxRecoveries = 3,
+    PositionEpsilon = 3,
+    StuckSampleInterval = 0.5,
+    EventName = "KaitunTravelRequest",
 }
 
---==================================================
--- CONTROLLER
---==================================================
-
-local Controller = {
-    Busy = false,
-    Status = "Idle",
-    TargetIsland = nil,
-    TargetPosition = nil,
-    LastReason = nil,
-    Cancelled = false,
-    RequestToken = 0,
-    RecoveryCount = 0,
-}
-
---==================================================
--- STATE / STATUS
---==================================================
-
-local function SetState(State, Reason)
-    Controller.Status = State
-    Controller.LastReason = Reason
-end
-
-local function IsCancelled(Token)
-    return Controller.Cancelled or Token ~= Controller.RequestToken
-end
-
---==================================================
--- CHARACTER HELPERS
---==================================================
-
-local function GetCharacter()
-    return LocalPlayer.Character
-end
-
-local function GetRoot()
-    local Character = GetCharacter()
-    if not Character then
-        return nil
-    end
-    return Character:FindFirstChild("HumanoidRootPart")
-end
-
-local function GetHumanoid()
-    local Character = GetCharacter()
-    if not Character then
-        return nil
-    end
-    return Character:FindFirstChildOfClass("Humanoid")
-end
-
-local function CharacterReady()
-    local Character = GetCharacter()
-    local Root = GetRoot()
-    local Humanoid = GetHumanoid()
-
-    return Character ~= nil
-        and Root ~= nil
-        and Humanoid ~= nil
-        and Humanoid.Health > 0
-end
-
---==================================================
--- ITEM / FRUIT PROTECTION
---==================================================
-
-local SpecialItems = {
+local SPECIAL_ITEMS = {
     ["God's Chalice"] = true,
     ["Sweet Chalice"] = true,
     ["Hallow Essence"] = true,
@@ -138,768 +82,757 @@ local SpecialItems = {
     ["Red Key"] = true,
 }
 
-local function IsFruit(Tool)
-    if not Tool then
-        return false
+--============================================================
+-- CONTROLLER
+--============================================================
+
+local Controller = {
+    Busy = false,
+    Status = "Idle",
+    TargetIsland = nil,
+    TargetPosition = nil,
+    LastReason = nil,
+    Cancelled = false,
+    RequestToken = 0,
+    RecoveryCount = 0,
+    LastObservedTarget = nil,
+}
+
+--============================================================
+-- HELPERS
+--============================================================
+
+local function safeString(v)
+    if v == nil then
+        return nil
     end
-
-    if Tool:GetAttribute("IsFruit") == true then
-        return true
-    end
-
-    if Tool:GetAttribute("ItemType") == "Fruit" then
-        return true
-    end
-
-    if Tool:GetAttribute("Type") == "Fruit" then
-        return true
-    end
-
-    local Name = string.lower(Tool.Name)
-
-    -- Clone-friendly fallbacks. Prefer explicit attributes above.
-    if string.find(Name, "fruit", 1, true) then
-        return true
-    end
-
-    return false
+    return tostring(v)
 end
 
-local function GetHeldTool()
-    local Character = GetCharacter()
-    if not Character then
+local function getCharacter()
+    return LocalPlayer and LocalPlayer.Character or nil
+end
+
+local function getHumanoid()
+    local character = getCharacter()
+    if not character then
+        return nil
+    end
+    return character:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRoot()
+    local character = getCharacter()
+    if not character then
+        return nil
+    end
+    return character:FindFirstChild("HumanoidRootPart")
+end
+
+local function isAlive()
+    local humanoid = getHumanoid()
+    local root = getRoot()
+    return humanoid ~= nil and humanoid.Health > 0 and root ~= nil
+end
+
+local function getObjectPosition(object)
+    if not object then
         return nil
     end
 
-    for _, Object in ipairs(Character:GetChildren()) do
-        if Object:IsA("Tool") then
-            return Object
+    if object:IsA("BasePart") then
+        return object.Position
+    end
+
+    if object:IsA("Model") then
+        return object:GetPivot().Position
+    end
+
+    if object:IsA("Attachment") then
+        return object.WorldPosition
+    end
+
+    return nil
+end
+
+local function findNamedChildIgnoreCase(parent, name)
+    if not parent or not name then
+        return nil
+    end
+
+    local exact = parent:FindFirstChild(name)
+    if exact then
+        return exact
+    end
+
+    local wanted = string.lower(name)
+    for _, child in ipairs(parent:GetChildren()) do
+        if string.lower(child.Name) == wanted then
+            return child
         end
     end
 
     return nil
 end
 
-local function CheckResetGuard()
-    local Tool = GetHeldTool()
-
-    -- Nothing held: reset allowed.
-    if not Tool then
-        return true, nil
-    end
-
-    -- Fruit: reset blocked.
-    if IsFruit(Tool) then
-        return false, Tool.Name
-    end
-
-    -- Special quest/summoning/key item: reset blocked.
-    if SpecialItems[Tool.Name] then
-        return false, Tool.Name
-    end
-
-    -- Ordinary sword / melee / normal item: reset allowed.
-    return true, nil
-end
-
---==================================================
--- ISLAND RESOLVER
---==================================================
-
-local function GetIslandFolder()
-    return workspace:FindFirstChild("Islands")
-end
-
-local function FindIsland(IslandName)
-    if type(IslandName) ~= "string" or IslandName == "" then
+local function findIsland(name)
+    if type(name) ~= "string" or name == "" then
         return nil
     end
 
-    local Folder = GetIslandFolder()
-    if not Folder then
+    local islands = workspace:FindFirstChild("Islands")
+    if not islands then
         return nil
     end
 
-    local Exact = Folder:FindFirstChild(IslandName)
-    if Exact then
-        return Exact
+    return findNamedChildIgnoreCase(islands, name)
+end
+
+local function getArrivalPoint(island)
+    if not island then
+        return nil
     end
 
-    local Wanted = string.lower(IslandName)
+    -- Prefer an explicitly authored safe/travel point in the clone.
+    local preferred = {
+        "TravelPoint",
+        "SafePoint",
+        "ArrivalPoint",
+        "Spawn",
+        "Center",
+    }
 
-    for _, Object in ipairs(Folder:GetChildren()) do
-        if string.lower(Object.Name) == Wanted then
-            return Object
+    for _, name in ipairs(preferred) do
+        local point = findNamedChildIgnoreCase(island, name)
+        local position = getObjectPosition(point)
+        if position then
+            return position
         end
     end
 
-    return nil
+    -- Fall back to model/part position.
+    return getObjectPosition(island)
 end
 
-local function GetObjectPosition(Object)
-    if not Object then
-        return nil
-    end
-
-    if Object:IsA("BasePart") then
-        return Object.Position
-    end
-
-    if Object:IsA("Model") then
-        local Primary = Object.PrimaryPart
-        if Primary then
-            return Primary.Position
-        end
-
-        return Object:GetPivot().Position
-    end
-
-    return nil
-end
-
-local function GetIslandBounds(Object)
-    if not Object then
+local function getIslandBounds(island)
+    if not island then
         return nil, nil
     end
 
-    if Object:IsA("BasePart") then
-        return Object.CFrame, Object.Size
-    end
+    if island:IsA("Model") then
+        local ok, cf, size = pcall(function()
+            local cframe, dimensions = island:GetBoundingBox()
+            return cframe, dimensions
+        end)
 
-    if Object:IsA("Model") then
-        local CFrame, Size = Object:GetBoundingBox()
-        return CFrame, Size
+        if ok and cf and size then
+            return cf, size
+        end
+    elseif island:IsA("BasePart") then
+        return island.CFrame, island.Size
     end
 
     return nil, nil
 end
 
-local function FindNamedPoint(Island)
-    local PreferredNames = {
-        "TravelPoint",
-        "SafePoint",
-        "Spawn",
-        "Center",
-    }
+local function clampInside(value, halfExtent, padding)
+    local limit = math.max(0, halfExtent - padding)
+    return math.clamp(value, -limit, limit)
+end
 
-    for _, Name in ipairs(PreferredNames) do
-        local Point = Island:FindFirstChild(Name, true)
-        if Point and Point:IsA("BasePart") then
-            return Point.Position
+local function getSafePointInsideIsland(island, preferredPoint)
+    local boxCFrame, size = getIslandBounds(island)
+    if not boxCFrame or not size then
+        return preferredPoint
+    end
+
+    local localPoint = boxCFrame:PointToObjectSpace(preferredPoint)
+    local padding = math.min(8, math.min(size.X, size.Y, size.Z) * 0.1)
+
+    -- Keep the point away from the outermost boundary where possible.
+    local clamped = Vector3.new(
+        clampInside(localPoint.X, size.X / 2, padding),
+        clampInside(localPoint.Y, size.Y / 2, padding),
+        clampInside(localPoint.Z, size.Z / 2, padding)
+    )
+
+    return boxCFrame:PointToWorldSpace(clamped)
+end
+
+local function getTargetPoint(island)
+    local arrival = getArrivalPoint(island)
+    if not arrival then
+        return nil
+    end
+    return getSafePointInsideIsland(island, arrival)
+end
+
+--============================================================
+-- HELD ITEM / FRUIT GUARD
+--============================================================
+
+local function getHeldTool()
+    local character = getCharacter()
+    if not character then
+        return nil
+    end
+
+    for _, child in ipairs(character:GetChildren()) do
+        if child:IsA("Tool") then
+            return child
         end
     end
 
     return nil
 end
 
-local function ClampInsideBounds(Position, BoundsCFrame, BoundsSize, Padding)
-    if not BoundsCFrame or not BoundsSize then
-        return Position
-    end
-
-    local Local = BoundsCFrame:PointToObjectSpace(Position)
-
-    local HalfX = math.max(0, BoundsSize.X * 0.5 - Padding)
-    local HalfY = math.max(0, BoundsSize.Y * 0.5 - Padding)
-    local HalfZ = math.max(0, BoundsSize.Z * 0.5 - Padding)
-
-    Local = Vector3.new(
-        math.clamp(Local.X, -HalfX, HalfX),
-        math.clamp(Local.Y, -HalfY, HalfY),
-        math.clamp(Local.Z, -HalfZ, HalfZ)
-    )
-
-    return BoundsCFrame:PointToWorldSpace(Local)
-end
-
-local function GetDestination(Island)
-    local NamedPoint = FindNamedPoint(Island)
-    local BoundsCFrame, BoundsSize = GetIslandBounds(Island)
-    local PivotPosition = GetObjectPosition(Island)
-
-    if NamedPoint then
-        return NamedPoint, BoundsCFrame, BoundsSize
-    end
-
-    if PivotPosition then
-        local Safe = ClampInsideBounds(
-            PivotPosition,
-            BoundsCFrame,
-            BoundsSize,
-            8
-        )
-        return Safe, BoundsCFrame, BoundsSize
-    end
-
-    return nil, BoundsCFrame, BoundsSize
-end
-
---==================================================
--- ARRIVAL CHECK
---==================================================
-
-local function IsInsideHorizontalBounds(Position, BoundsCFrame, BoundsSize, Padding)
-    if not BoundsCFrame or not BoundsSize then
+local function isFruit(tool)
+    if not tool then
         return false
     end
 
-    local Local = BoundsCFrame:PointToObjectSpace(Position)
-
-    local HalfX = math.max(0, BoundsSize.X * 0.5 - Padding)
-    local HalfZ = math.max(0, BoundsSize.Z * 0.5 - Padding)
-
-    return math.abs(Local.X) <= HalfX
-        and math.abs(Local.Z) <= HalfZ
-end
-
-local function IsArrived(TargetPosition, BoundsCFrame, BoundsSize)
-    local Root = GetRoot()
-    if not Root then
-        return false
-    end
-
-    local Distance = (Root.Position - TargetPosition).Magnitude
-
-    if Distance <= DEFAULTS.ArrivalRadius then
+    if tool:GetAttribute("IsFruit") == true then
         return true
     end
 
-    -- Large islands can be considered arrived once the character is inside
-    -- the island bounds, even when not exactly at the center point.
-    if IsInsideHorizontalBounds(
-        Root.Position,
-        BoundsCFrame,
-        BoundsSize,
-        8
-    ) then
+    if tool:GetAttribute("ItemType") == "Fruit" then
         return true
     end
 
-    return false
+    if tool:GetAttribute("Type") == "Fruit" then
+        return true
+    end
+
+    local name = string.lower(tool.Name)
+    return string.find(name, "fruit", 1, true) ~= nil
 end
 
---==================================================
--- WAYPOINT BUILDER
---==================================================
-
-local function BuildWaypoints(StartPosition, TargetPosition)
-    local Waypoints = {}
-    local Difference = TargetPosition - StartPosition
-    local Distance = Difference.Magnitude
-
-    if Distance <= DEFAULTS.PositionEpsilon then
-        return Waypoints
+local function getResetBlockReason()
+    local tool = getHeldTool()
+    if not tool then
+        return nil
     end
 
-    local Count = math.max(
-        1,
-        math.ceil(Distance / DEFAULTS.WaypointDistance)
-    )
-
-    for Index = 1, Count do
-        local Alpha = Index / Count
-        Waypoints[#Waypoints + 1] = StartPosition:Lerp(TargetPosition, Alpha)
+    if isFruit(tool) then
+        return "HoldingFruit:" .. tool.Name
     end
 
-    return Waypoints
+    if SPECIAL_ITEMS[tool.Name] then
+        return "HoldingSpecialItem:" .. tool.Name
+    end
+
+    return nil
 end
 
---==================================================
--- SAFE RESET
---==================================================
+--============================================================
+-- ROUTE
+--============================================================
 
-local function WaitWithCancel(Duration, Token)
-    local Start = os.clock()
+local function buildWaypoints(startPosition, targetPosition)
+    local points = {}
+    local difference = targetPosition - startPosition
+    local distance = difference.Magnitude
 
-    while os.clock() - Start < Duration do
-        if IsCancelled(Token) then
-            return false
-        end
-        task.wait(0.05)
+    if distance <= 0 then
+        return points
     end
 
-    return true
+    local count = math.max(1, math.ceil(distance / DEFAULTS.WaypointDistance))
+    for index = 1, count do
+        points[index] = startPosition:Lerp(targetPosition, index / count)
+    end
+
+    return points
 end
 
-local function ResetCharacter(Token)
-    if IsCancelled(Token) then
-        return false
-    end
-
-    SetState("Resetting")
-
-    local Allowed, ItemName = CheckResetGuard()
-
-    if not Allowed then
-        SetState("Blocked", "Holding: " .. tostring(ItemName))
-        return false
-    end
-
-    local Humanoid = GetHumanoid()
-    if not Humanoid or Humanoid.Health <= 0 then
-        return false
-    end
-
-    -- This is for your own game's reset system. For maximum reliability,
-    -- replace this with your server-approved respawn/reset RemoteEvent.
-    Humanoid.Health = 0
-
-    return true
+local function isCloseTo(positionA, positionB, radius)
+    return (positionA - positionB).Magnitude <= radius
 end
 
-local function WaitForRespawn(OldCharacter, Token)
-    SetState("WaitingRespawn")
+--============================================================
+-- CANCELLATION TOKEN
+--============================================================
 
-    local Start = os.clock()
+local function tokenIsCurrent(token)
+    return token == Controller.RequestToken and not Controller.Cancelled
+end
 
-    while os.clock() - Start < DEFAULTS.RespawnTimeout do
-        if IsCancelled(Token) then
-            return false
-        end
+--============================================================
+-- SOFT MOVEMENT FOR CLONE
+--============================================================
 
-        local Character = GetCharacter()
-        local Root = GetRoot()
-        local Humanoid = GetHumanoid()
+local function moveByInterpolation(targetPosition, timeout, token)
+    local root = getRoot()
+    if not root then
+        return false, "NoRoot"
+    end
 
-        if Character
-            and Character ~= OldCharacter
-            and Root
-            and Humanoid
-            and Humanoid.Health > 0 then
-            return true
+    local startCFrame = root.CFrame
+    local targetCFrame = CFrame.new(targetPosition)
+    local distance = (root.Position - targetPosition).Magnitude
+
+    if distance <= DEFAULTS.PositionEpsilon then
+        return true, "AlreadyThere"
+    end
+
+    local travelTime = math.clamp(distance / 120, 0.8, 4.0)
+    local startTime = os.clock()
+    local lastPosition = root.Position
+    local lastProgressTime = startTime
+
+    while true do
+        if not tokenIsCurrent(token) then
+            return false, "Cancelled"
         end
 
-        task.wait(0.1)
-    end
-
-    return false
-end
-
---==================================================
--- NORMAL TRAVEL WITH RECOVERY
---==================================================
-
-local function TryNormalTravel(TargetPosition, BoundsCFrame, BoundsSize, Token)
-    SetState("NormalTravel")
-
-    local Humanoid = GetHumanoid()
-    local Root = GetRoot()
-
-    if not Humanoid or not Root or Humanoid.Health <= 0 then
-        return false, "CharacterUnavailable"
-    end
-
-    local Success = pcall(function()
-        local Path = PathfindingService:CreatePath({
-            AgentRadius = 2,
-            AgentHeight = 5,
-            AgentCanJump = true,
-            AgentCanClimb = true,
-            WaypointSpacing = 6,
-        })
-
-        Path:ComputeAsync(Root.Position, TargetPosition)
-
-        if Path.Status ~= Enum.PathStatus.Success then
-            error("PathFailed")
+        if not isAlive() then
+            return false, "CharacterLost"
         end
 
-        for _, Waypoint in ipairs(Path:GetWaypoints()) do
-            if IsCancelled(Token) then
-                error("Cancelled")
+        local elapsed = os.clock() - startTime
+        if elapsed >= timeout then
+            return false, "Timeout"
+        end
+
+        local alpha = math.clamp(elapsed / travelTime, 0, 1)
+        root.CFrame = startCFrame:Lerp(targetCFrame, alpha)
+
+        local currentPosition = root.Position
+        if (currentPosition - lastPosition).Magnitude >= DEFAULTS.PositionEpsilon then
+            lastPosition = currentPosition
+            lastProgressTime = os.clock()
+        elseif os.clock() - lastProgressTime >= DEFAULTS.StuckTimeout then
+            return false, "Stuck"
+        end
+
+        if alpha >= 1 then
+            return true, "Arrived"
+        end
+
+        RunService.Heartbeat:Wait()
+    end
+end
+
+--============================================================
+-- NORMAL TRAVEL (<= 1500)
+--============================================================
+
+local function normalTravel(targetPosition, token)
+    local humanoid = getHumanoid()
+    local root = getRoot()
+    if not humanoid or not root then
+        return false, "NoCharacter"
+    end
+
+    local path = PathfindingService:CreatePath({
+        AgentRadius = 2,
+        AgentHeight = 5,
+        AgentCanJump = true,
+        AgentCanClimb = true,
+        WaypointSpacing = 8,
+    })
+
+    local ok = pcall(function()
+        path:ComputeAsync(root.Position, targetPosition)
+    end)
+
+    if ok and path.Status == Enum.PathStatus.Success then
+        local waypoints = path:GetWaypoints()
+        for _, waypoint in ipairs(waypoints) do
+            if not tokenIsCurrent(token) then
+                return false, "Cancelled"
             end
 
-            if IsArrived(TargetPosition, BoundsCFrame, BoundsSize) then
-                return
+            if not isAlive() then
+                return false, "CharacterLost"
             end
 
-            if Waypoint.Action == Enum.PathWaypointAction.Jump then
-                Humanoid.Jump = true
+            if waypoint.Action == Enum.PathWaypointAction.Jump then
+                humanoid.Jump = true
             end
 
-            local Start = os.clock()
-            local PreviousPosition = Root.Position
-            local LastMoved = os.clock()
-            local Finished = false
+            humanoid:MoveTo(waypoint.Position)
 
-            Humanoid:MoveTo(Waypoint.Position)
+            local started = os.clock()
+            local lastPosition = root.Position
 
-            while os.clock() - Start < DEFAULTS.NormalMoveTimeout do
-                if IsCancelled(Token) then
-                    error("Cancelled")
+            while os.clock() - started < DEFAULTS.NormalMoveTimeout do
+                if not tokenIsCurrent(token) then
+                    return false, "Cancelled"
                 end
 
-                if IsArrived(TargetPosition, BoundsCFrame, BoundsSize) then
-                    return
+                if not isAlive() then
+                    return false, "CharacterLost"
                 end
 
-                Root = GetRoot()
-                if not Root then
-                    error("RootLost")
-                end
-
-                local Delta = (Root.Position - PreviousPosition).Magnitude
-
-                if Delta >= DEFAULTS.PositionEpsilon then
-                    PreviousPosition = Root.Position
-                    LastMoved = os.clock()
-                elseif os.clock() - LastMoved >= DEFAULTS.StuckTimeout then
-                    error("Stuck")
-                end
-
-                if (Root.Position - Waypoint.Position).Magnitude <= 6 then
-                    Finished = true
+                if isCloseTo(root.Position, waypoint.Position, 6) then
                     break
+                end
+
+                local current = root.Position
+                if (current - lastPosition).Magnitude < DEFAULTS.PositionEpsilon then
+                    -- Keep waiting, but don't let a totally stuck MoveTo block forever.
+                    if os.clock() - started >= DEFAULTS.StuckTimeout then
+                        return false, "Stuck"
+                    end
+                else
+                    lastPosition = current
                 end
 
                 RunService.Heartbeat:Wait()
             end
 
-            if not Finished and (Root.Position - Waypoint.Position).Magnitude > 8 then
-                error("MoveTimeout")
+            if not isCloseTo(root.Position, waypoint.Position, 6) then
+                return false, "WaypointTimeout"
             end
         end
-    end)
 
-    if Success and IsArrived(TargetPosition, BoundsCFrame, BoundsSize) then
-        return true, "Arrived"
+        return true, "PathComplete"
     end
 
-    return false, "NormalTravelFailed"
+    -- Fallback movement for a clone if pathfinding cannot build a route.
+    humanoid:MoveTo(targetPosition)
+    local started = os.clock()
+    while os.clock() - started < DEFAULTS.NormalMoveTimeout do
+        if not tokenIsCurrent(token) then
+            return false, "Cancelled"
+        end
+        if not isAlive() then
+            return false, "CharacterLost"
+        end
+        if isCloseTo(root.Position, targetPosition, DEFAULTS.ArrivalRadius) then
+            return true, "FallbackComplete"
+        end
+        RunService.Heartbeat:Wait()
+    end
+
+    return false, "NormalTravelTimeout"
 end
 
---==================================================
--- RESET-TRAVEL WAYPOINT MOVEMENT
---==================================================
+--============================================================
+-- RESET / RESPAWN
+--============================================================
 
-local function MoveWaypoint(TargetPoint, Token)
-    SetState("Travelling")
-
-    local Root = GetRoot()
-    if not Root then
-        return false, "RootLost"
+local function resetCharacter(token)
+    if not tokenIsCurrent(token) then
+        return false, "Cancelled"
     end
 
-    local StartPosition = Root.Position
-    local Distance = (TargetPoint - StartPosition).Magnitude
-
-    if Distance <= DEFAULTS.PositionEpsilon then
-        return true, "AlreadyThere"
+    local guard = getResetBlockReason()
+    if guard then
+        return false, guard
     end
 
-    local Duration = math.max(
-        1.25,
-        1.25 + (Distance / DEFAULTS.WaypointDistance) * 0.8
-    )
+    local character = getCharacter()
+    local humanoid = getHumanoid()
+    if not character or not humanoid then
+        return false, "NoCharacter"
+    end
 
-    -- Never allow a single waypoint to consume more than the internal timeout.
-    Duration = math.min(Duration, DEFAULTS.WaypointTimeout)
+    -- This is intended for a clone that uses normal Humanoid respawning.
+    humanoid.Health = 0
 
-    local StartTime = os.clock()
-    local PreviousPosition = StartPosition
-    local LastMoved = os.clock()
-
-    while os.clock() - StartTime < DEFAULTS.WaypointTimeout do
-        if IsCancelled(Token) then
+    local started = os.clock()
+    while os.clock() - started < DEFAULTS.RespawnTimeout do
+        if not tokenIsCurrent(token) then
             return false, "Cancelled"
         end
 
-        Root = GetRoot()
-        if not Root then
-            return false, "RootLost"
-        end
+        local newCharacter = getCharacter()
+        local newHumanoid = getHumanoid()
+        local newRoot = getRoot()
 
-        local Progress = math.clamp(
-            (os.clock() - StartTime) / Duration,
-            0,
-            1
-        )
-
-        Root.CFrame = CFrame.new(
-            StartPosition:Lerp(TargetPoint, Progress)
-        )
-
-        if Progress >= 1 then
-            return true, "ReachedWaypoint"
-        end
-
-        if (Root.Position - PreviousPosition).Magnitude >= DEFAULTS.PositionEpsilon then
-            PreviousPosition = Root.Position
-            LastMoved = os.clock()
-        elseif os.clock() - LastMoved >= DEFAULTS.StuckTimeout then
-            return false, "Stuck"
+        if newCharacter and newCharacter ~= character and newHumanoid and newRoot and newHumanoid.Health > 0 then
+            task.wait(DEFAULTS.PostRespawnDelay)
+            return true, "Respawned"
         end
 
         RunService.Heartbeat:Wait()
     end
 
-    return true, "ReachedWaypoint"
+    return false, "RespawnTimeout"
 end
 
---==================================================
--- RECOVERY
---==================================================
+--============================================================
+-- ARRIVAL CHECK
+--============================================================
 
-local function Recover(TargetPosition, BoundsCFrame, BoundsSize, Token)
-    Controller.RecoveryCount += 1
-
-    if Controller.RecoveryCount > DEFAULTS.MaxRecoveries then
-        return false, "RecoveryLimit"
+local function verifyArrival(island, targetPosition)
+    local root = getRoot()
+    if not root then
+        return false
     end
 
-    SetState("Recovering", "Attempt " .. tostring(Controller.RecoveryCount))
-
-    if IsArrived(TargetPosition, BoundsCFrame, BoundsSize) then
-        return true, "AlreadyArrived"
+    if isCloseTo(root.Position, targetPosition, DEFAULTS.ArrivalRadius) then
+        return true
     end
 
-    -- Give the character a tiny moment to settle before rebuilding the route.
-    if not WaitWithCancel(0.25, Token) then
-        return false, "Cancelled"
+    local boxCFrame, size = getIslandBounds(island)
+    if boxCFrame and size then
+        local localPosition = boxCFrame:PointToObjectSpace(root.Position)
+        local half = size / 2
+        return math.abs(localPosition.X) <= half.X
+            and math.abs(localPosition.Y) <= half.Y + DEFAULTS.ArrivalRadius
+            and math.abs(localPosition.Z) <= half.Z
     end
 
-    return true, "Retry"
+    return false
 end
 
---==================================================
--- MAIN REQUEST
---==================================================
+--============================================================
+-- RESULT
+--============================================================
 
-function Controller:Request(IslandName)
+local function publishResult(success, reason, targetIsland)
+    local result = {
+        Success = success == true,
+        Reason = reason,
+        TargetIsland = targetIsland,
+    }
+
+    _G.ResetTeleportResult = result
+    Controller.LastReason = reason
+
+    return result
+end
+
+--============================================================
+-- REQUEST PIPELINE
+--============================================================
+
+local function runRequest(islandName, token)
+    Controller.Busy = true
+    Controller.Status = "Busy"
+    Controller.TargetIsland = islandName
+    Controller.TargetPosition = nil
+    Controller.RecoveryCount = 0
+
+    if type(islandName) ~= "string" or islandName == "" then
+        Controller.Busy = false
+        Controller.Status = "Failed"
+        return publishResult(false, "InvalidTarget", islandName)
+    end
+
+    local island = findIsland(islandName)
+    if not island then
+        Controller.Busy = false
+        Controller.Status = "Failed"
+        return publishResult(false, "IslandNotFound", islandName)
+    end
+
+    local targetPosition = getTargetPoint(island)
+    if not targetPosition then
+        Controller.Busy = false
+        Controller.Status = "Failed"
+        return publishResult(false, "NoTargetPoint", islandName)
+    end
+
+    Controller.TargetPosition = targetPosition
+
+    while tokenIsCurrent(token) do
+        if not isAlive() then
+            Controller.RecoveryCount += 1
+            if Controller.RecoveryCount > DEFAULTS.MaxRecoveries then
+                Controller.Busy = false
+                Controller.Status = "Failed"
+                return publishResult(false, "TooManyRecoveries", islandName)
+            end
+            task.wait(0.25)
+        else
+            break
+        end
+    end
+
+    if not tokenIsCurrent(token) then
+        Controller.Busy = false
+        Controller.Status = "Failed"
+        return publishResult(false, "Cancelled", islandName)
+    end
+
+    local root = getRoot()
+    if not root then
+        Controller.Busy = false
+        Controller.Status = "Failed"
+        return publishResult(false, "NoRoot", islandName)
+    end
+
+    local distance = (root.Position - targetPosition).Magnitude
+
+    --========================================================
+    -- <= 1500 studs: normal travel, never reset.
+    --========================================================
+    if distance <= DEFAULTS.TravelDistance then
+        local success, reason = normalTravel(targetPosition, token)
+        if success and verifyArrival(island, targetPosition) then
+            Controller.Busy = false
+            Controller.Status = "Complete"
+            return publishResult(true, "NormalTravelComplete", islandName)
+        end
+
+        Controller.Busy = false
+        Controller.Status = "Failed"
+        return publishResult(false, reason or "NormalTravelFailed", islandName)
+    end
+
+    --========================================================
+    -- > 1500 studs: Reset Teleport branch.
+    --========================================================
+    if UserSettings["Reset Teleport"] ~= true then
+        Controller.Busy = false
+        Controller.Status = "Failed"
+        return publishResult(false, "ResetDisabled", islandName)
+    end
+
+    local guard = getResetBlockReason()
+    if guard then
+        Controller.Busy = false
+        Controller.Status = "Blocked"
+        return publishResult(false, guard, islandName)
+    end
+
+    local delayTime = tonumber(UserSettings["Reset Teleport Delay"]) or 2.5
+    delayTime = math.max(0, delayTime)
+
+    local delayStarted = os.clock()
+    while os.clock() - delayStarted < delayTime do
+        if not tokenIsCurrent(token) then
+            Controller.Busy = false
+            Controller.Status = "Failed"
+            return publishResult(false, "Cancelled", islandName)
+        end
+        RunService.Heartbeat:Wait()
+    end
+
+    -- Double-check immediately before reset.
+    guard = getResetBlockReason()
+    if guard then
+        Controller.Busy = false
+        Controller.Status = "Blocked"
+        return publishResult(false, guard, islandName)
+    end
+
+    local resetSuccess, resetReason = resetCharacter(token)
+    if not resetSuccess then
+        Controller.Busy = false
+        Controller.Status = "Failed"
+        return publishResult(false, resetReason, islandName)
+    end
+
+    -- The island may have changed while we reset, so resolve it again.
+    island = findIsland(islandName)
+    if not island then
+        Controller.Busy = false
+        Controller.Status = "Failed"
+        return publishResult(false, "IslandGoneAfterReset", islandName)
+    end
+
+    targetPosition = getTargetPoint(island)
+    if not targetPosition then
+        Controller.Busy = false
+        Controller.Status = "Failed"
+        return publishResult(false, "NoTargetPointAfterReset", islandName)
+    end
+
+    Controller.TargetPosition = targetPosition
+
+    root = getRoot()
+    if not root then
+        Controller.Busy = false
+        Controller.Status = "Failed"
+        return publishResult(false, "NoRootAfterReset", islandName)
+    end
+
+    local waypoints = buildWaypoints(root.Position, targetPosition)
+    local waypointIndex = 1
+
+    while waypointIndex <= #waypoints do
+        if not tokenIsCurrent(token) then
+            Controller.Busy = false
+            Controller.Status = "Failed"
+            return publishResult(false, "Cancelled", islandName)
+        end
+
+        local point = waypoints[waypointIndex]
+        local success, reason = moveByInterpolation(point, DEFAULTS.WaypointTimeout, token)
+
+        if success then
+            waypointIndex += 1
+        else
+            Controller.RecoveryCount += 1
+            if Controller.RecoveryCount > DEFAULTS.MaxRecoveries then
+                Controller.Busy = false
+                Controller.Status = "Failed"
+                return publishResult(false, reason or "WaypointFailed", islandName)
+            end
+
+            -- Re-resolve the island and rebuild the route from the current position.
+            island = findIsland(islandName)
+            targetPosition = island and getTargetPoint(island) or nil
+            root = getRoot()
+
+            if not island or not targetPosition or not root then
+                Controller.Busy = false
+                Controller.Status = "Failed"
+                return publishResult(false, "RecoveryTargetUnavailable", islandName)
+            end
+
+            Controller.TargetPosition = targetPosition
+            waypoints = buildWaypoints(root.Position, targetPosition)
+            waypointIndex = 1
+            task.wait(0.2)
+        end
+    end
+
+    island = findIsland(islandName)
+    targetPosition = island and getTargetPoint(island) or targetPosition
+
+    if island and targetPosition and verifyArrival(island, targetPosition) then
+        Controller.Busy = false
+        Controller.Status = "Complete"
+        return publishResult(true, "ResetTeleportComplete", islandName)
+    end
+
+    -- Final approach retry inside the island's arrival area.
+    root = getRoot()
+    if root and targetPosition then
+        local finalDistance = (root.Position - targetPosition).Magnitude
+        if finalDistance <= DEFAULTS.FinalApproachDistance then
+            local success = moveByInterpolation(targetPosition, DEFAULTS.WaypointTimeout, token)
+            if success and island and verifyArrival(island, targetPosition) then
+                Controller.Busy = false
+                Controller.Status = "Complete"
+                return publishResult(true, "FinalApproachComplete", islandName)
+            end
+        end
+    end
+
+    Controller.Busy = false
+    Controller.Status = "Failed"
+    return publishResult(false, "ArrivalCheckFailed", islandName)
+end
+
+function Controller:Request(islandName)
     if self.Busy then
         return false, "Busy"
     end
 
-    if type(IslandName) ~= "string" or IslandName == "" then
-        return false, "InvalidTarget"
-    end
-
-    self.Busy = true
-    self.Cancelled = false
     self.RequestToken += 1
-    self.TargetIsland = IslandName
-    self.TargetPosition = nil
-    self.LastReason = nil
-    self.RecoveryCount = 0
+    self.Cancelled = false
+    local token = self.RequestToken
 
-    local Token = self.RequestToken
+    task.spawn(function()
+        runRequest(islandName, token)
+    end)
 
-    local function Finish(Success, Reason)
-        if Success then
-            SetState("Complete", Reason)
-        else
-            if Reason == "Cancelled" then
-                SetState("Cancelled", Reason)
-            elseif self.Status ~= "Blocked" then
-                SetState("Failed", Reason)
-            end
-        end
-
-        self.Busy = false
-        return Success, Reason
-    end
-
-    SetState("Checking")
-
-    if not CharacterReady() then
-        return Finish(false, "CharacterUnavailable")
-    end
-
-    local Island = FindIsland(IslandName)
-    if not Island then
-        return Finish(false, "IslandNotFound")
-    end
-
-    SetState("ResolvingTarget")
-
-    local TargetPosition, BoundsCFrame, BoundsSize = GetDestination(Island)
-
-    if not TargetPosition then
-        return Finish(false, "TargetPositionNotFound")
-    end
-
-    self.TargetPosition = TargetPosition
-
-    local Root = GetRoot()
-    if not Root then
-        return Finish(false, "RootUnavailable")
-    end
-
-    if IsArrived(TargetPosition, BoundsCFrame, BoundsSize) then
-        return Finish(true, "AlreadyArrived")
-    end
-
-    local Distance = (Root.Position - TargetPosition).Magnitude
-
-    --==================================================
-    -- NEAR: NORMAL TRAVEL
-    --==================================================
-
-    if Distance <= DEFAULTS.TravelDistance then
-        for _ = 1, DEFAULTS.MaxRecoveries + 1 do
-            local Success, Reason = TryNormalTravel(
-                TargetPosition,
-                BoundsCFrame,
-                BoundsSize,
-                Token
-            )
-
-            if Success then
-                return Finish(true, Reason)
-            end
-
-            if IsCancelled(Token) then
-                return Finish(false, "Cancelled")
-            end
-
-            local Recovered, RecoveryReason = Recover(
-                TargetPosition,
-                BoundsCFrame,
-                BoundsSize,
-                Token
-            )
-
-            if not Recovered then
-                return Finish(false, RecoveryReason)
-            end
-        end
-
-        return Finish(false, "NormalTravelRetriesExceeded")
-    end
-
-    --==================================================
-    -- FAR: RESET TELEPORT
-    --==================================================
-
-    if UserSettings["Reset Teleport"] ~= true then
-        return Finish(false, "ResetDisabled")
-    end
-
-    -- First item check.
-    local Allowed, ItemName = CheckResetGuard()
-    if not Allowed then
-        SetState("Blocked", "Holding: " .. tostring(ItemName))
-        return Finish(false, "Holding: " .. tostring(ItemName))
-    end
-
-    local Delay = tonumber(UserSettings["Reset Teleport Delay"]) or 2.5
-    Delay = math.max(0, Delay)
-
-    SetState("ResetDelay")
-
-    if not WaitWithCancel(Delay, Token) then
-        return Finish(false, "Cancelled")
-    end
-
-    -- Second item check immediately before reset.
-    Allowed, ItemName = CheckResetGuard()
-    if not Allowed then
-        SetState("Blocked", "Holding: " .. tostring(ItemName))
-        return Finish(false, "Holding: " .. tostring(ItemName))
-    end
-
-    -- Save old character and reset.
-    local OldCharacter = GetCharacter()
-
-    if not ResetCharacter(Token) then
-        if self.Status == "Blocked" then
-            self.Busy = false
-            return false, self.LastReason
-        end
-        return Finish(false, "ResetFailed")
-    end
-
-    if not WaitForRespawn(OldCharacter, Token) then
-        return Finish(false, "RespawnTimeout")
-    end
-
-    if not WaitWithCancel(DEFAULTS.PostRespawnDelay, Token) then
-        return Finish(false, "Cancelled")
-    end
-
-    --==================================================
-    -- REBUILD ROUTE AFTER RESPAWN
-    --==================================================
-
-    for RecoveryIndex = 0, DEFAULTS.MaxRecoveries do
-        if IsCancelled(Token) then
-            return Finish(false, "Cancelled")
-        end
-
-        local CurrentIsland = FindIsland(IslandName)
-        if not CurrentIsland then
-            return Finish(false, "IslandRemoved")
-        end
-
-        TargetPosition, BoundsCFrame, BoundsSize = GetDestination(CurrentIsland)
-        if not TargetPosition then
-            return Finish(false, "TargetPositionLost")
-        end
-
-        self.TargetPosition = TargetPosition
-
-        Root = GetRoot()
-        if not Root then
-            return Finish(false, "RootUnavailableAfterRespawn")
-        end
-
-        if IsArrived(TargetPosition, BoundsCFrame, BoundsSize) then
-            return Finish(true, "ArrivedAfterRespawn")
-        end
-
-        SetState("BuildingRoute")
-
-        local Waypoints = BuildWaypoints(
-            Root.Position,
-            TargetPosition
-        )
-
-        local RouteFailed = false
-        local FailureReason = nil
-
-        for _, Point in ipairs(Waypoints) do
-            local Success, Reason = MoveWaypoint(Point, Token)
-
-            if not Success then
-                RouteFailed = true
-                FailureReason = Reason
-                break
-            end
-
-            if IsArrived(TargetPosition, BoundsCFrame, BoundsSize) then
-                return Finish(true, "Arrived")
-            end
-        end
-
-        if not RouteFailed then
-            if IsArrived(TargetPosition, BoundsCFrame, BoundsSize) then
-                return Finish(true, "Arrived")
-            end
-            FailureReason = "ArrivalNotVerified"
-        end
-
-        if RecoveryIndex >= DEFAULTS.MaxRecoveries then
-            return Finish(false, FailureReason or "RouteFailed")
-        end
-
-        SetState("Recovering", FailureReason)
-
-        if not WaitWithCancel(0.35, Token) then
-            return Finish(false, "Cancelled")
-        end
-    end
-
-    return Finish(false, "UnexpectedFailure")
+    return true, "Accepted"
 end
-
---==================================================
--- CONTROL / STATUS API
---==================================================
 
 function Controller:Cancel()
     self.Cancelled = true
     self.RequestToken += 1
-    SetState("Cancelled", "ManualCancel")
+    self.Busy = false
+    self.Status = "Failed"
+    publishResult(false, "Cancelled", self.TargetIsland)
 end
 
 function Controller:IsBusy()
@@ -921,19 +854,117 @@ function Controller:GetState()
     }
 end
 
-function Controller:IsProtectedItemHeld()
-    local Allowed, ItemName = CheckResetGuard()
-    return not Allowed, ItemName
+--============================================================
+-- PUBLIC HANDSHAKE / ADAPTER INPUTS
+--============================================================
+
+local function normalizeTarget(value)
+    if type(value) == "string" and value ~= "" then
+        return value
+    end
+
+    if type(value) == "table" then
+        return value.TargetIsland or value.Island or value.Target
+    end
+
+    return nil
 end
 
-function Controller:GetDefaults()
-    return table.clone(DEFAULTS)
+local function inspectSharedTarget()
+    local candidates = {
+        _G.KaitunTargetIsland,
+        _G.TargetIsland,
+    }
+
+    for _, candidate in ipairs(candidates) do
+        local target = normalizeTarget(candidate)
+        if target then
+            return target
+        end
+    end
+
+    return nil
 end
 
---==================================================
--- GLOBAL EXPORT
---==================================================
+local eventConnection
+local eventObject = ReplicatedStorage:FindFirstChild(DEFAULTS.EventName)
+if eventObject and eventObject:IsA("BindableEvent") then
+    eventConnection = eventObject.Event:Connect(function(payload)
+        local target = normalizeTarget(payload)
+        if target and target ~= Controller.LastObservedTarget then
+            Controller.LastObservedTarget = target
+            Controller:Request(target)
+        end
+    end)
+end
+
+-- Polling is deliberately limited to public shared globals only.
+task.spawn(function()
+    while true do
+        local target = inspectSharedTarget()
+
+        if target and target ~= Controller.LastObservedTarget then
+            Controller.LastObservedTarget = target
+            if not Controller.Busy then
+                Controller:Request(target)
+            end
+        end
+
+        task.wait(DEFAULTS.PollInterval)
+    end
+end)
 
 _G.ResetTeleport = Controller
+_G.ResetTeleportAdapter = Controller
 
-print("[ResetTeleport] Controller loaded successfully")
+if _G.ResetTeleportResult == nil then
+    _G.ResetTeleportResult = {
+        Success = false,
+        Reason = "Idle",
+        TargetIsland = nil,
+    }
+end
+
+--============================================================
+-- OPTIONAL SELF-CHECKS (no game mutation)
+--============================================================
+
+local function runSelfChecks()
+    local checks = 0
+    local passed = 0
+
+    local function check(condition)
+        checks += 1
+        if condition then
+            passed += 1
+        end
+    end
+
+    check(DEFAULTS.TravelDistance == 1500)
+    check(DEFAULTS.WaypointDistance == 300)
+    check(DEFAULTS.WaypointTimeout == 10)
+    check(DEFAULTS.StuckTimeout == 4)
+    check(DEFAULTS.ArrivalRadius == 100)
+    check(type(SPECIAL_ITEMS["God's Chalice"]) == "boolean")
+    check(type(SPECIAL_ITEMS["Sweet Chalice"]) == "boolean")
+    check(type(SPECIAL_ITEMS["Hallow Essence"]) == "boolean")
+    check(type(Controller.Request) == "function")
+    check(type(Controller.Cancel) == "function")
+    check(type(Controller.GetState) == "function")
+
+    local route = buildWaypoints(Vector3.zero, Vector3.new(900, 0, 0))
+    check(#route == 3)
+    check(route[#route] and route[#route].X == 900)
+
+    local longRoute = buildWaypoints(Vector3.zero, Vector3.new(10000, 0, 0))
+    check(#longRoute == 34)
+    check(longRoute[#longRoute] and math.abs(longRoute[#longRoute].X - 10000) < 0.001)
+
+    return passed, checks
+end
+
+_G.ResetTeleportSelfCheck = runSelfChecks
+
+-- No Status spam; this only prints once at load.
+local passed, total = runSelfChecks()
+print(string.format("[ResetTeleportAdapter] Loaded | SelfCheck %d/%d", passed, total))
